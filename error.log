@@ -1,0 +1,8 @@
+nev = 1
+fd = 3
+sockfd =  3
+Client 127.0.0.1 connected, fd is 5
+nev = 1
+fd = 5
+sockfd =  3
+fd 5 client say: hello
