@@ -76,9 +76,11 @@ public:
     int                sockfd;
     sockaddr          *addr;
     socklen_t          addr_len;
+    bool               connected;
     
     socks5_upstream():
-        addr(NULL)
+        addr(NULL),
+        connected(false)
     {}
 
     ~socks5_upstream() {
@@ -108,39 +110,51 @@ public:
     client_status              status;
 
     socks5_upstream            upstream;
+
+    int                        capacity;;
+    int                        size;
+    char                      *buffer;
     
     socks5_client_ctx(): 
         addr(NULL),
-        status(SHAKING_HANDS)
+        status(SHAKING_HANDS),
+        capacity(BUFFER_SIZE),
+        size(0),
+        buffer((char *)malloc(capacity))
     {}
 
     ~socks5_client_ctx() {
         if(addr != NULL) {
             free(addr);
         }
+
+        free(buffer);
     }
 };
 
 typedef    std::map<int, socks5_client_ctx*>   client_ctx_map;
 
 int        init_socket(std::string ip, int port);
-void       accept_and_add(client_ctx_map &mp, struct kevent* events,
-                         int listenfd, int &ev_number);
-void       recv_and_process(client_ctx_map &mp ,struct kevent *events, 
-                            struct kevent *kv, int sockfd, int &ev_number);
+void       accept_and_add(client_ctx_map &mp, int listenfd);
+void       recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd);
 int        socks5_shake_hands(int sockfd, char *buffer, int length);
-int        socks5_recv(int sockfd, char *buffer, int size, int flag);
+int        socks5_send(int sockfd, void *buffer, int size, int flag);
+int        socks5_recv(int sockfd, void *buffer, int size, int flag);
 void       close_and_delete(client_ctx_map &mp, int fd, struct kevent *kv,
-                            int &ev_number, socks5_client_ctx *ctx);
+                            socks5_client_ctx *ctx);
 int        parse_shake_hands(const char *buffer, int size, 
                              shake_hands_request_t &r);
 char       choose_authentication_method(const shake_hands_request_t &r);
 int        authentication(char method);
 int        socks5_connect(int sockfd, char *buffer, int size,
-                         socks5_client_ctx *ctx);
+                          socks5_client_ctx *ctx, client_ctx_map &mp);
+int        connect_response_serialization(connect_response_t *res,
+                                          char *buffer, int size);
 char       parse_connect_request(char *buffer, int size, 
                                  socks5_client_ctx *ctx);
 int        connect_to_upstream(socks5_client_ctx *ctx);
+int        socks5_forward(int dstfd, int srcfd, socks5_client_ctx *ctx);
+char*      buffer_expansion(char *buffer, int capacity);
 
 
 #endif

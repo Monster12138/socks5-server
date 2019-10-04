@@ -39,27 +39,37 @@
 using namespace std;
 
 
+int                               ev_number = 0;
+struct kevent                     events[1024];
+
 int 
 main(int argc, const char * argv[]) {
-    if(argc != 3) {
+    if(argc != 2 && argc != 3) {
         cout << "Usage: program ip port" << endl;
         return 1;
     }
     
-    int                               port, listenfd, newfd, kq, ev_number = 0;
+    int                               port, listenfd, newfd, kq;
     char                              buffer[1024] = { 0 };
     string                            ip;
     socklen_t                         socklen;
     sockaddr_in                       peer_addr;
-    struct kevent                     events[1024], revents[1024];
+    struct kevent                     revents[1024];
     client_ctx_map                    mp;
     
     
     socklen = sizeof(sockaddr_in);
-    ip = argv[1];
-    port = atoi(argv[2]);
+    if(argc == 3) {
+        ip = argv[1];
+        port = atoi(argv[2]);
 
+    } else {
+        port = atoi(argv[1]);
+    }
+
+    cout << "init socket" << endl;
     listenfd = init_socket(ip, port);
+    cout << "init socket done" << endl;
     
     kq = kqueue();
     
@@ -80,10 +90,10 @@ main(int argc, const char * argv[]) {
 
             fd = (long long)kv.udata;
             if(fd == listenfd) {
-                accept_and_add(mp, events, fd, ev_number);
+                accept_and_add(mp, fd);
 
             } else {
-                recv_and_process(mp, events, &kv, fd, ev_number);
+                recv_and_process(mp, &kv, fd);
             }
         }
     }
@@ -129,7 +139,7 @@ init_socket(string ip, int port) {
 }
 
 void 
-accept_and_add(client_ctx_map &mp, struct kevent* events, int listenfd, int &ev_number) {
+accept_and_add(client_ctx_map &mp, int listenfd) {
     socks5_client_ctx      *ctx;
 
     ctx = new socks5_client_ctx;
@@ -149,8 +159,7 @@ accept_and_add(client_ctx_map &mp, struct kevent* events, int listenfd, int &ev_
 }
 
 void
-recv_and_process(client_ctx_map &mp ,struct kevent *events, 
-                 struct kevent *kv, int sockfd, int &ev_number) {
+recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd) {
     int                            ret;
     char                           buffer[BUFFER_SIZE];
     client_status                  status;
@@ -161,7 +170,7 @@ recv_and_process(client_ctx_map &mp ,struct kevent *events,
 
     ret = socks5_recv(sockfd, buffer, BUFFER_SIZE, 0);
     if(ret <= 0 ) {
-        close_and_delete(mp, sockfd, kv, ev_number, ctx);
+        close_and_delete(mp, sockfd, kv, ctx);
         return;
     }
 
@@ -169,16 +178,22 @@ recv_and_process(client_ctx_map &mp ,struct kevent *events,
     case SHAKING_HANDS: 
         {
             ret = socks5_shake_hands(sockfd, buffer, BUFFER_SIZE);
+            ctx->status = CONNECTING;
             break;
         }
     case CONNECTING:
         {
-            ret = socks5_connect(sockfd, buffer, BUFFER_SIZE, ctx);                        
+            ret = socks5_connect(sockfd, buffer, BUFFER_SIZE, ctx, mp);
+            ctx->status = WORKING;
             break;
         }
     case WORKING:
         {
-
+            if(sockfd == ctx->sockfd) {
+                ret = socks5_forward(ctx->upstream.sockfd, ctx->sockfd, ctx);
+            } else {
+                ret = socks5_forward(ctx->sockfd, ctx->upstream.sockfd, ctx);
+            }
             break;
         }
     default:
@@ -190,12 +205,27 @@ recv_and_process(client_ctx_map &mp ,struct kevent *events,
 
     if(ret < 0) {
         cout << "Close client " << ctx->ip << endl;
-        close_and_delete(mp, sockfd, kv, ev_number, ctx);
+        close_and_delete(mp, sockfd, kv, ctx);
     }
 }
 
 int
-socks5_recv(int sockfd, char *buffer, int size, int flag) {
+socks5_send(int sockfd, void *buffer, int size, int flag) {
+    int        ret;
+
+    ret = send(sockfd, buffer, size, 0);
+    if(ret < 0) {
+        cout << "sockfd " << sockfd << " send error" << endl;
+        return -1;
+    } else {
+        cout << "fd " << sockfd << " send " << ret << " bytes data" << endl;
+    }
+
+    return ret;
+}
+
+int
+socks5_recv(int sockfd, void *buffer, int size, int flag) {
     int        ret;
 
     ret = recv(sockfd, buffer, BUFFER_SIZE, 0);
@@ -205,6 +235,8 @@ socks5_recv(int sockfd, char *buffer, int size, int flag) {
     } else if(ret == 0) {
         cout << "A client disconnected, sockfd is " << sockfd << endl;
         return -1;
+    } else {
+        cout << "fd " << sockfd << " recv " << ret << " bytes data" << endl;
     }
 
     return ret;
@@ -212,20 +244,30 @@ socks5_recv(int sockfd, char *buffer, int size, int flag) {
 
 void
 close_and_delete(client_ctx_map &mp, int fd, struct kevent *kv,
-                 int &ev_number, socks5_client_ctx *ctx) {
+                 socks5_client_ctx *ctx) {
     EV_SET(kv, fd, 0, EV_DELETE | EV_DISABLE, 0, 0, NULL);
+    if(ctx->upstream.connected) {
+        ::close(ctx->upstream.sockfd);
+        mp.erase(ctx->upstream.sockfd);
+        EV_SET(kv, ctx->upstream.sockfd, 0, EV_DELETE | EV_DISABLE, 0, 0, NULL);
+    }
     ::close(fd);
-    delete ctx;
     mp.erase(fd);
+    delete ctx;
     --ev_number;
 }
 
 int
 socks5_shake_hands(int sockfd, char *buffer, int size) {
+    int                           ret;
     shake_hands_request_t         req;
     shake_hands_response_t        res;
 
-    cout << "sockfd " << sockfd << " client say: " << buffer << endl;
+    cout << "shake hands: ";
+    for(int i = 0; i < 3; ++i) {
+        printf("%#X ", *(buffer + i));
+    }
+    cout << endl;
     if(parse_shake_hands(buffer, size, req) < 0) {
         return -1;
     }
@@ -235,10 +277,16 @@ socks5_shake_hands(int sockfd, char *buffer, int size) {
     if(res.method < 0) {
         cout << "No acceptable methods" << endl;
         res.method = 0xff;
-        send(sockfd, &res, sizeof(res), 0);
+        ret = socks5_send(sockfd, &res, sizeof(res), 0);
+        if(ret < 0) {
+            return -1;
+        }
         return -1;
     }
-    send(sockfd, &res, sizeof(res), 0);
+    ret = socks5_send(sockfd, &res, sizeof(res), 0);
+    if(ret < 0) {
+        return -1;
+    }
 
     if(authentication(res.method) < 0) {
         cout << "Authentic failed, fd = " << sockfd << endl;
@@ -254,6 +302,7 @@ parse_shake_hands(const char *buffer, int size, shake_hands_request_t &r) {
     const char    *p;
     
     len = strlen(buffer);
+    p = buffer;
     
     if(*p != 0x05) {
         cerr << "version error" << endl;
@@ -284,7 +333,10 @@ authentication(char method) {
 }
 
 int
-socks5_connect(int sockfd, char *buffer, int size, socks5_client_ctx *ctx) {
+socks5_connect(int sockfd, char *buffer, int size,
+               socks5_client_ctx *ctx, client_ctx_map &mp) {
+    int                        len, ret;
+    char                       send_buffer[BUFFER_SIZE];
     connect_response_t        *res;
     
     res = &ctx->conn_res;
@@ -294,13 +346,75 @@ socks5_connect(int sockfd, char *buffer, int size, socks5_client_ctx *ctx) {
         res->reply = connect_to_upstream(ctx);
     }
 
+    if(res->reply == 0) {
+        ctx->upstream.connected = true;
+        mp[ctx->upstream.sockfd] = ctx;
+        EV_SET(&events[ev_number++], ctx->upstream.sockfd, EVFILT_READ, 
+               EV_ADD | EV_ENABLE, 0, 0, (void *)ctx->upstream.sockfd);
+    }
+
     res->version = 0x05;
     res->reserved = 0x00;
     res->address_type = 0x01;
+    res->bind_address = "\0\0\0\0";
+    res->bind_port = 0x0000;
 
-
-
+    len = connect_response_serialization(res, send_buffer, BUFFER_SIZE);
+    
+    ret = socks5_send(sockfd, send_buffer, len, 0);
+    if(ret < 0) {
+        return -1;
+    }
+    
     return 0;
+}
+
+int
+connect_response_serialization(connect_response_t *res, char *buffer, int size) {
+    int        byte_count;
+    char      *p;
+
+    byte_count = 0;
+    p = buffer;
+
+    memcpy(p, res, 4);
+    p += 4;
+    byte_count += 4;
+
+    switch(res->address_type) {
+    case 0x01:
+        {
+            //memcpy(p, res->bind_address.c_str(), 4);
+            memset(p, 0, 4);
+            p += 4;
+            byte_count += 4;
+            break;
+        }
+    case 0x03:
+        {
+            memcpy(p, res->bind_address.c_str(), res->bind_address.size());
+            p += res->bind_address.size();
+            byte_count += res->bind_address.size();
+            break;
+        }
+    case 0x04:
+        {
+            //memcpy(p, res->bind_address.c_str(), 16);
+            memset(p, 0, 16);
+            p += 16;
+            byte_count += 16;
+            break;
+        }
+    default:
+        {
+            /* Never run here */
+        }
+    }
+    
+    memcpy(p, &res->bind_port, 2);
+    byte_count += 2;
+
+    return byte_count;
 }
 
 char 
@@ -310,6 +424,14 @@ parse_connect_request(char *buffer, int size, socks5_client_ctx *ctx) {
 
     p = buffer;
     req = &ctx->conn_req;
+
+    cout << "connect request: ";
+    for(int i = 0; i < 4; ++i) {
+        printf("%#X ", *(buffer + i));
+    }
+    printf("%s", buffer + 4);
+    
+    cout << endl;
 
     req->version = *p;
     if(req->version != 0x05) {
@@ -450,4 +572,53 @@ connect_to_upstream(socks5_client_ctx *ctx) {
     }
     
     return 0;
+}
+
+int
+socks5_forward(int dstfd, int srcfd, socks5_client_ctx *ctx) {
+    int          capacity, size, ret;
+    char        *buffer;
+    
+    capacity = ctx->capacity;
+    size = ctx->size;
+    buffer = ctx->buffer;
+
+    while(1) {
+        if(size == capacity) {
+            buffer = buffer_expansion(buffer, capacity);
+            if(buffer == NULL) {
+                return -1;
+            }
+            capacity *= 2;
+        }
+        
+        ret = socks5_recv(srcfd, buffer + size, capacity - size, 0);
+        if(ret < 0) {
+            return -1;
+        }
+
+        size += ret;
+        if(size != capacity) {
+            break;
+        }
+    }
+
+    ret = socks5_send(dstfd, buffer, size, 0);
+    if(ret < 0) {
+        return -1;
+    }
+    
+    ctx->size = 0;
+
+    return 0;
+}
+
+char *
+buffer_expansion(char *buffer, int capacity) {
+    int        new_capacity;
+
+    new_capacity = 2 * capacity;
+    buffer = (char *)reallocf(buffer, new_capacity);
+
+    return buffer;
 }
