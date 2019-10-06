@@ -67,20 +67,19 @@ main(int argc, const char * argv[]) {
         port = atoi(argv[1]);
     }
 
-    cout << "init socket" << endl;
     listenfd = init_socket(ip, port);
-    cout << "init socket done" << endl;
     
     kq = kqueue();
     
     EV_SET(&events[ev_number++], listenfd,  EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, (void *)listenfd);
     while(1) {
+        cout << "[debug] kqueue wait..." << endl;
         int nev = kevent(kq, events, ev_number, revents, ev_number, NULL);
         if(nev < 0) {
-            cout << "kqueue error" << endl;
+            cout << "[error] kqueue error" << endl;
             break;
         } else if(nev == 0) {
-            cout << "kqueue timeout..." << endl;
+            cout << "[debug] kqueue timeout..." << endl;
             continue;
         }
 
@@ -106,7 +105,7 @@ int
 init_socket(string ip, int port) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if(sockfd < 0) {
-        cout << "create sockfd error" << endl;
+        cout << "[error] create sockfd error" << endl;
         exit(-1);
     }
     
@@ -125,13 +124,13 @@ init_socket(string ip, int port) {
     int ret;
     ret = ::bind(sockfd, (sockaddr *)&local, socklen);
     if(ret < 0) {
-        cout << "bind error" << endl;
+        cout << "[error] bind error" << endl;
         exit(-1);
     }
     
     ret = listen(sockfd, 5);
     if(ret < 0) {
-        cout << "listen error" << endl;
+        cout << "[error] listen error" << endl;
         exit(-1);
     }
     
@@ -154,21 +153,20 @@ accept_and_add(client_ctx_map &mp, int listenfd) {
 
     mp[ctx->sockfd] = ctx;
 
-    cout << "Client " << ctx->ip
+    cout << "[debug] Client " << ctx->ip
          << " connected, fd is " << ctx->sockfd << endl; 
 }
 
 void
 recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd) {
     int                            ret;
-    char                           buffer[BUFFER_SIZE];
     client_status                  status;
     socks5_client_ctx             *ctx;
 
     ctx = mp[sockfd];
     status = ctx->status;
-
-    ret = socks5_recv(sockfd, buffer, BUFFER_SIZE, 0);
+    
+    ret = socks5_recv(sockfd, 0, ctx);
     if(ret <= 0 ) {
         close_and_delete(mp, sockfd, kv, ctx);
         return;
@@ -177,13 +175,13 @@ recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd) {
     switch(status) {
     case SHAKING_HANDS: 
         {
-            ret = socks5_shake_hands(sockfd, buffer, BUFFER_SIZE);
+            ret = socks5_shake_hands(sockfd, ctx);
             ctx->status = CONNECTING;
             break;
         }
     case CONNECTING:
         {
-            ret = socks5_connect(sockfd, buffer, BUFFER_SIZE, ctx, mp);
+            ret = socks5_connect(sockfd, ctx, mp);
             ctx->status = WORKING;
             break;
         }
@@ -198,13 +196,13 @@ recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd) {
         }
     default:
         {
-            cout << "Client " << ctx->ip << " status error" << endl;
+            cout << "[error] Client " << ctx->ip << " status error" << endl;
             ret = -1;
         }
     }
 
     if(ret < 0) {
-        cout << "Close client " << ctx->ip << endl;
+        cout << "[debug] Close client " << ctx->ip << endl;
         close_and_delete(mp, sockfd, kv, ctx);
     }
 }
@@ -215,31 +213,52 @@ socks5_send(int sockfd, void *buffer, int size, int flag) {
 
     ret = send(sockfd, buffer, size, 0);
     if(ret < 0) {
-        cout << "sockfd " << sockfd << " send error" << endl;
+        cout << "[error] sockfd " << sockfd << " send error" << endl;
         return -1;
     } else {
-        cout << "fd " << sockfd << " send " << ret << " bytes data" << endl;
+        cout << "[debug] fd " << sockfd << " send " << ret << " bytes data" << endl;
     }
 
     return ret;
 }
 
 int
-socks5_recv(int sockfd, void *buffer, int size, int flag) {
-    int        ret;
+socks5_recv(int sockfd, int flag, socks5_client_ctx *ctx) {
+    int        ret, *size, *capacity;
+    char     **buffer;
 
-    ret = recv(sockfd, buffer, BUFFER_SIZE, 0);
-    if(ret < 0) {
-        cout << "sockfd " << sockfd << " recv error" << endl;
-        return -1;
-    } else if(ret == 0) {
-        cout << "A client disconnected, sockfd is " << sockfd << endl;
-        return -1;
-    } else {
-        cout << "fd " << sockfd << " recv " << ret << " bytes data" << endl;
+    buffer = &ctx->buffer;
+    size = &ctx->size;
+    capacity = &ctx->capacity;
+
+
+    while(1) {
+        if(*size == *capacity) {
+            *buffer = buffer_expansion(*buffer, *capacity);
+            if(*buffer == NULL) {
+                return -1;
+            }
+            *capacity *= 2;
+        }
+
+        ret = recv(srcfd, *buffer + size, *capacity - *size, 0);
+        if(ret < 0) {
+            cout << "[error] sockfd " << sockfd << " recv error" << endl;
+            return -1;
+        } else if(ret == 0) {
+            cout << "[debug] A client disconnected, sockfd is " << sockfd << endl;
+            return -1;
+        } else {
+            cout << "[debug] fd " << sockfd << " recv " << ret << " bytes data" << endl;
+        }
+
+        *size += ret;
+        if(*size != *capacity) {
+            break;
+        }
     }
 
-    return ret;
+    return *size;
 }
 
 void
@@ -253,29 +272,35 @@ close_and_delete(client_ctx_map &mp, int fd, struct kevent *kv,
     }
     ::close(fd);
     mp.erase(fd);
+
     delete ctx;
     --ev_number;
 }
 
 int
-socks5_shake_hands(int sockfd, char *buffer, int size) {
+socks5_shake_hands(int sockfd, socks5_client_ctx *ctx) {
     int                           ret;
+    char                         *buffer;
     shake_hands_request_t         req;
     shake_hands_response_t        res;
 
-    cout << "shake hands: ";
+    buffer = ctx->buffer;
+
+    cout << "[debug] shake hands: ";
     for(int i = 0; i < 3; ++i) {
         printf("%#X ", *(buffer + i));
     }
     cout << endl;
-    if(parse_shake_hands(buffer, size, req) < 0) {
+
+    if(parse_shake_hands(ctx,  req) < 0) {
         return -1;
     }
+    ctx->size = 0;
 
     res.version = 0x05;
     res.method = choose_authentication_method(req);
     if(res.method < 0) {
-        cout << "No acceptable methods" << endl;
+        cout << "[debug] No acceptable methods" << endl;
         res.method = 0xff;
         ret = socks5_send(sockfd, &res, sizeof(res), 0);
         if(ret < 0) {
@@ -289,7 +314,7 @@ socks5_shake_hands(int sockfd, char *buffer, int size) {
     }
 
     if(authentication(res.method) < 0) {
-        cout << "Authentic failed, fd = " << sockfd << endl;
+        cout << "[error] Authentic failed, fd = " << sockfd << endl;
         return -1;
     }
 
@@ -297,15 +322,18 @@ socks5_shake_hands(int sockfd, char *buffer, int size) {
 }
 
 int
-parse_shake_hands(const char *buffer, int size, shake_hands_request_t &r) {
-    int            len;
+parse_shake_hands(socks5_client_ctx *ctx, shake_hands_request_t &r) {
     const char    *p;
     
-    len = strlen(buffer);
-    p = buffer;
+    if(ctx->size < 3) {
+        return -1;
+    }
+
+    p = ctx->buffer;
     
     if(*p != 0x05) {
-        cerr << "version error" << endl;
+        printf("[error] client %s:%d version error(%#x)\n",
+               ctx->ip.c_str(), ctx->port, *p);
         return -1;
     }
 
@@ -333,18 +361,18 @@ authentication(char method) {
 }
 
 int
-socks5_connect(int sockfd, char *buffer, int size,
-               socks5_client_ctx *ctx, client_ctx_map &mp) {
+socks5_connect(int sockfd, socks5_client_ctx *ctx, client_ctx_map &mp) {
     int                        len, ret;
     char                       send_buffer[BUFFER_SIZE];
     connect_response_t        *res;
     
     res = &ctx->conn_res;
 
-    res->reply = parse_connect_request(buffer, size, ctx);
+    res->reply = parse_connect_request(ctx);
     if(res->reply == 0) {
         res->reply = connect_to_upstream(ctx);
     }
+    ctx->size = 0;
 
     if(res->reply == 0) {
         ctx->upstream.connected = true;
@@ -418,34 +446,32 @@ connect_response_serialization(connect_response_t *res, char *buffer, int size) 
 }
 
 char 
-parse_connect_request(char *buffer, int size, socks5_client_ctx *ctx) {
-    char                         *p;
+parse_connect_request(socks5_client_ctx *ctx) {
+    const char                   *p;
     connect_request_t            *req;
 
-    p = buffer;
+    p = ctx->buffer;
     req = &ctx->conn_req;
 
-    cout << "connect request: ";
+    cout << "[debug] connect request: ";
     for(int i = 0; i < 4; ++i) {
         printf("%#X ", *(buffer + i));
     }
-    printf("%s", buffer + 4);
-    
     cout << endl;
 
     req->version = *p;
     if(req->version != 0x05) {
-        cout << "Client " << ctx->ip 
+        cout << "[error] Client " << ctx->ip 
              << " connect request: version error" << endl;
         return 0x02;
     }
 
     ++p;
     req->command = *p;
-    if(req->command != 0x01 ||
-       req->command != 0x02 ||
+    if(req->command != 0x01 &&
+       req->command != 0x02 &&
        req->command != 0x03) {
-        cout << "Client " << ctx->ip
+        cout << "[error] Client " << ctx->ip
              << " connect request: command error" << endl;
         return 0x07;
     }
@@ -453,17 +479,17 @@ parse_connect_request(char *buffer, int size, socks5_client_ctx *ctx) {
     ++p;
     req->reserved = *p;
     if(req->reserved != 0x00) {
-        cout << "Client " << ctx->ip
+        cout << "[error] Client " << ctx->ip
              << " connect request: reserved error" << endl;
         return 0x02;
     }
 
     ++p;
     req->address_type = *p;
-    if(req->address_type != 0x01 ||
-       req->address_type != 0x03 ||
+    if(req->address_type != 0x01 &&
+       req->address_type != 0x03 &&
        req->address_type != 0x04) {
-        cout << "Client " << ctx->ip
+        cout << "[error] Client " << ctx->ip
              << " connect request: address type error" << endl;
         return 0x08;
     }
@@ -475,6 +501,7 @@ parse_connect_request(char *buffer, int size, socks5_client_ctx *ctx) {
             char ip[INET_ADDRSTRLEN] = {0};
             req->dest_address = inet_ntop(AF_INET, p, ip, INET_ADDRSTRLEN);
             p += 4;
+             
             break;
         }
     case 0x03:
@@ -526,22 +553,21 @@ connect_to_upstream(socks5_client_ctx *ctx) {
             upstream->sockfd = socket(AF_INET, SOCK_STREAM, 0);
             ret = connect(upstream->sockfd, upstream->addr, upstream->addr_len);
             if(ret < 0) {
-                cout << "Connect to " << req->dest_address << " failed" << endl;
+                cout << "[error] Connect to " << req->dest_address << " failed" << endl;
                 return 0x04;
             }
+            break;
         }
     case 0x03:
         {
-            /* TODO: support IPv6 */
-        }
-    case 0x04:
-        {
+            char                  *ip;
             struct hostent        *ht;
             sockaddr_in           *peer_addr;
 
+
             ht = gethostbyname(req->dest_address.c_str());
             if(ht->h_addr == NULL) {
-                cout << "Hostname " << req->dest_address << " DNS parse failed" << endl;
+                cout << "[error] Hostname " << req->dest_address << " DNS parse failed" << endl;
                 return 0x04;
             }
 
@@ -552,18 +578,29 @@ connect_to_upstream(socks5_client_ctx *ctx) {
             upstream->sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
             for(int i = 0; ht->h_addr_list[i]; ++i) {
-                peer_addr->sin_addr.s_addr = *(in_addr_t *)ht->h_addr_list[i];
+                ip = inet_ntoa(*(in_addr*)ht->h_addr_list[i]);
+                cout << "[debug] connecting " << ip << "..." << endl;
+                peer_addr->sin_family = AF_INET;
+                peer_addr->sin_addr.s_addr = inet_addr(ip);
+                peer_addr->sin_port = htons(80);
 
                 ret = connect(upstream->sockfd, upstream->addr, upstream->addr_len);
                 if(ret == 0) {
                     break;
                 }
+                cout << "[error] connect " << ip << " failed" << endl;
             }
 
             if(ret < 0) {
-                cout << "Connect to " << req->dest_address << " failed" << endl;
+                cout << "[error] Connect to " << req->dest_address << " failed" << endl;
                 return 0x04;
             }
+            break;
+        }
+    case 0x04:
+        {
+            /* TODO: support IPv6 */
+            break;
         }
     default:
         {
@@ -578,30 +615,12 @@ int
 socks5_forward(int dstfd, int srcfd, socks5_client_ctx *ctx) {
     int          capacity, size, ret;
     char        *buffer;
+
+    cout << "[debug] forward: fd " << srcfd << "->" << " fd " << dstfd << endl;
     
     capacity = ctx->capacity;
     size = ctx->size;
     buffer = ctx->buffer;
-
-    while(1) {
-        if(size == capacity) {
-            buffer = buffer_expansion(buffer, capacity);
-            if(buffer == NULL) {
-                return -1;
-            }
-            capacity *= 2;
-        }
-        
-        ret = socks5_recv(srcfd, buffer + size, capacity - size, 0);
-        if(ret < 0) {
-            return -1;
-        }
-
-        size += ret;
-        if(size != capacity) {
-            break;
-        }
-    }
 
     ret = socks5_send(dstfd, buffer, size, 0);
     if(ret < 0) {
