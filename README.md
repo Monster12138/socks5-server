@@ -8,7 +8,7 @@ Linux support will be updated in the future.
 This proxy server needs to be used with the proxy client, such as the Chrome browser plug-in SwitchyOmega.
 
 ### SwitchyOmega config
-![image](https://github.com/Monster12138/socks5-server/SwitchyOmega-config.png)
+![image](https://github.com/Monster12138/socks5-server/blob/master/SwitchyOmega-config.png)
 
 ## Build 
 ```
