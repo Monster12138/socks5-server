@@ -7,7 +7,7 @@
 本代理服务器需要配合代理客户端食用，例如Chrome浏览器的SwitchyOmega插件等。
 
 ## SwitchyOmega插件设置
-![image](https://github.com/Monster12138/socks5-server/SwitchyOmega-config.png)
+![image](https://github.com/Monster12138/socks5-server/blob/master/SwitchyOmega-config.png)
 
 ## 编译 
 ```
