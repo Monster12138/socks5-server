@@ -130,6 +130,7 @@ public:
         
         if(buffer != NULL) {
             free(buffer);
+            printf("[debug] free buffer %p\n", buffer);
         }
     }
 };
@@ -137,17 +138,17 @@ public:
 typedef    std::map<int, socks5_client_ctx*>   client_ctx_map;
 
 int        init_socket(std::string ip, int port);
-void       accept_and_add(client_ctx_map &mp, int listenfd);
-void       recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd);
+int        kqueue_register(int kq, int fd, void *data);
+void       accept_and_add(int kq, client_ctx_map &mp, int listenfd);
+void       recv_and_process(int kq, client_ctx_map &mp , struct kevent *kv, int sockfd);
 int        socks5_shake_hands(int sockfd, socks5_client_ctx *ctx);
 int        socks5_send(int sockfd, void *buffer, int size, int flag);
 int        socks5_recv(int sockfd, int flag, socks5_client_ctx *ctx);
-void       close_and_delete(client_ctx_map &mp, int fd, struct kevent *kv,
-                            socks5_client_ctx *ctx);
+void       close_and_delete(client_ctx_map &mp, socks5_client_ctx *ctx);
 int        parse_shake_hands(socks5_client_ctx *ctx, shake_hands_request_t &r);
 char       choose_authentication_method(const shake_hands_request_t &r);
 int        authentication(char method);
-int        socks5_connect(int sockfd, socks5_client_ctx *ctx,
+int        socks5_connect(int kq, int sockfd, socks5_client_ctx *ctx,
                           client_ctx_map &mp);
 int        connect_response_serialization(connect_response_t *res,
                                           char *buffer, int size);

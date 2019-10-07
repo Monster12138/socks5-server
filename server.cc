@@ -38,10 +38,6 @@
 
 using namespace std;
 
-
-int                               ev_number = 0;
-struct kevent                     events[1024];
-
 int 
 main(int argc, const char * argv[]) {
     if(argc != 2 && argc != 3) {
@@ -49,7 +45,7 @@ main(int argc, const char * argv[]) {
         return 1;
     }
     
-    int                               port, listenfd, newfd, kq;
+    int                               port, listenfd, newfd, kq, ret;
     char                              buffer[1024] = { 0 };
     string                            ip;
     socklen_t                         socklen;
@@ -70,11 +66,14 @@ main(int argc, const char * argv[]) {
     listenfd = init_socket(ip, port);
     
     kq = kqueue();
-    
-    EV_SET(&events[ev_number++], listenfd,  EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, (void *)listenfd);
+    ret = kqueue_register(kq, listenfd, NULL);
+    if(ret < 0) {
+        cout << "[error] kqueue error" << endl;
+        exit(1);
+    }
     while(1) {
         cout << "[debug] kqueue wait..." << endl;
-        int nev = kevent(kq, events, ev_number, revents, ev_number, NULL);
+        int nev = kevent(kq, NULL, 0, revents, 1024, NULL);
         if(nev < 0) {
             cout << "[error] kqueue error" << endl;
             break;
@@ -87,12 +86,12 @@ main(int argc, const char * argv[]) {
             int                 fd;
             struct kevent       kv = revents[i];
 
-            fd = (long long)kv.udata;
+            fd = kv.ident;
             if(fd == listenfd) {
-                accept_and_add(mp, fd);
+                accept_and_add(kq, mp, fd);
 
             } else {
-                recv_and_process(mp, &kv, fd);
+                recv_and_process(kq, mp, &kv, fd);
             }
         }
     }
@@ -137,8 +136,17 @@ init_socket(string ip, int port) {
     return sockfd;
 }
 
+int 
+kqueue_register(int kq, int fd, void *data) {
+    struct kevent changes[1];
+    EV_SET(&changes[0], fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+
+    int ret = kevent(kq, changes, 1, NULL, 0, NULL);
+    return ret;
+}
+
 void 
-accept_and_add(client_ctx_map &mp, int listenfd) {
+accept_and_add(int kq, client_ctx_map &mp, int listenfd) {
     socks5_client_ctx      *ctx;
 
     ctx = new socks5_client_ctx;
@@ -147,9 +155,9 @@ accept_and_add(client_ctx_map &mp, int listenfd) {
 
     ctx->sockfd = accept(listenfd, ctx->addr, &ctx->addr_len);
     ctx->ip = inet_ntoa(((sockaddr_in *)(ctx->addr))->sin_addr);
+    ctx->port = ntohs(((sockaddr_in *)ctx->addr)->sin_port);
 
-    EV_SET(&events[ev_number++], ctx->sockfd, EVFILT_READ, 
-           EV_ADD | EV_ENABLE, 0, 0, (void *)ctx->sockfd);
+    kqueue_register(kq, ctx->sockfd, NULL);
 
     mp[ctx->sockfd] = ctx;
 
@@ -158,7 +166,7 @@ accept_and_add(client_ctx_map &mp, int listenfd) {
 }
 
 void
-recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd) {
+recv_and_process(int kq, client_ctx_map &mp , struct kevent *kv, int sockfd) {
     int                            ret;
     client_status                  status;
     socks5_client_ctx             *ctx;
@@ -168,7 +176,7 @@ recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd) {
     
     ret = socks5_recv(sockfd, 0, ctx);
     if(ret <= 0 ) {
-        close_and_delete(mp, sockfd, kv, ctx);
+        close_and_delete(mp, ctx);
         return;
     }
 
@@ -181,7 +189,7 @@ recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd) {
         }
     case CONNECTING:
         {
-            ret = socks5_connect(sockfd, ctx, mp);
+            ret = socks5_connect(kq, sockfd, ctx, mp);
             ctx->status = WORKING;
             break;
         }
@@ -203,7 +211,7 @@ recv_and_process(client_ctx_map &mp , struct kevent *kv, int sockfd) {
 
     if(ret < 0) {
         cout << "[debug] Close client " << ctx->ip << endl;
-        close_and_delete(mp, sockfd, kv, ctx);
+        close_and_delete(mp, ctx);
     }
 }
 
@@ -241,7 +249,7 @@ socks5_recv(int sockfd, int flag, socks5_client_ctx *ctx) {
             *capacity *= 2;
         }
 
-        ret = recv(srcfd, *buffer + size, *capacity - *size, 0);
+        ret = recv(sockfd, *buffer + *size, *capacity - *size, 0);
         if(ret < 0) {
             cout << "[error] sockfd " << sockfd << " recv error" << endl;
             return -1;
@@ -262,19 +270,17 @@ socks5_recv(int sockfd, int flag, socks5_client_ctx *ctx) {
 }
 
 void
-close_and_delete(client_ctx_map &mp, int fd, struct kevent *kv,
-                 socks5_client_ctx *ctx) {
-    EV_SET(kv, fd, 0, EV_DELETE | EV_DISABLE, 0, 0, NULL);
+close_and_delete(client_ctx_map &mp, socks5_client_ctx *ctx) {
     if(ctx->upstream.connected) {
         ::close(ctx->upstream.sockfd);
+        cout << "[debug] close fd " << ctx->upstream.sockfd << endl;
         mp.erase(ctx->upstream.sockfd);
-        EV_SET(kv, ctx->upstream.sockfd, 0, EV_DELETE | EV_DISABLE, 0, 0, NULL);
     }
-    ::close(fd);
-    mp.erase(fd);
+    ::close(ctx->sockfd);
+    cout << "[debug] close fd " << ctx->sockfd << endl;
+    mp.erase(ctx->sockfd);
 
     delete ctx;
-    --ev_number;
 }
 
 int
@@ -361,7 +367,7 @@ authentication(char method) {
 }
 
 int
-socks5_connect(int sockfd, socks5_client_ctx *ctx, client_ctx_map &mp) {
+socks5_connect(int kq, int sockfd, socks5_client_ctx *ctx, client_ctx_map &mp) {
     int                        len, ret;
     char                       send_buffer[BUFFER_SIZE];
     connect_response_t        *res;
@@ -377,8 +383,10 @@ socks5_connect(int sockfd, socks5_client_ctx *ctx, client_ctx_map &mp) {
     if(res->reply == 0) {
         ctx->upstream.connected = true;
         mp[ctx->upstream.sockfd] = ctx;
-        EV_SET(&events[ev_number++], ctx->upstream.sockfd, EVFILT_READ, 
-               EV_ADD | EV_ENABLE, 0, 0, (void *)ctx->upstream.sockfd);
+        kqueue_register(kq, ctx->upstream.sockfd, NULL);
+
+        printf("[debug] client %s:%d fd = %d, upstream is connected ,upstream fd = %d\n",
+               ctx->ip.c_str(), ctx->port, ctx->sockfd, ctx->upstream.sockfd);
     }
 
     res->version = 0x05;
@@ -455,7 +463,7 @@ parse_connect_request(socks5_client_ctx *ctx) {
 
     cout << "[debug] connect request: ";
     for(int i = 0; i < 4; ++i) {
-        printf("%#X ", *(buffer + i));
+        printf("%#X ", *(p + i));
     }
     cout << endl;
 
@@ -501,7 +509,7 @@ parse_connect_request(socks5_client_ctx *ctx) {
             char ip[INET_ADDRSTRLEN] = {0};
             req->dest_address = inet_ntop(AF_INET, p, ip, INET_ADDRSTRLEN);
             p += 4;
-             
+            
             break;
         }
     case 0x03:
@@ -525,7 +533,9 @@ parse_connect_request(socks5_client_ctx *ctx) {
         }
     }
 
-    req->dest_port = *(short *)p;
+    req->dest_port = ntohs(*(short *)p);
+    printf("[debug] client %s:%d's upstream server: %s:%d\n",
+           ctx->ip.c_str(), ctx->port, req->dest_address.c_str(), req->dest_port);
 
     return 0x00;
 }
@@ -548,7 +558,9 @@ connect_to_upstream(socks5_client_ctx *ctx) {
             upstream->addr = (sockaddr*)peer_addr;
             upstream->addr_len = sizeof(sockaddr_in);
 
+            peer_addr->sin_family = AF_INET;
             peer_addr->sin_addr.s_addr = inet_addr(req->dest_address.c_str());
+            peer_addr->sin_port = htons(req->dest_port);
             
             upstream->sockfd = socket(AF_INET, SOCK_STREAM, 0);
             ret = connect(upstream->sockfd, upstream->addr, upstream->addr_len);
@@ -582,7 +594,7 @@ connect_to_upstream(socks5_client_ctx *ctx) {
                 cout << "[debug] connecting " << ip << "..." << endl;
                 peer_addr->sin_family = AF_INET;
                 peer_addr->sin_addr.s_addr = inet_addr(ip);
-                peer_addr->sin_port = htons(80);
+                peer_addr->sin_port = htons(req->dest_port);
 
                 ret = connect(upstream->sockfd, upstream->addr, upstream->addr_len);
                 if(ret == 0) {
