@@ -45,12 +45,10 @@ main(int argc, const char * argv[]) {
         return 1;
     }
     
-    int                               port, listenfd, newfd, kq, ret;
-    char                              buffer[1024] = { 0 };
+    int                               port, listenfd, newfd, evfd, ret;
     string                            ip;
     socklen_t                         socklen;
     sockaddr_in                       peer_addr;
-    struct kevent                     revents[1024];
     client_ctx_map                    mp;
     
     
@@ -64,14 +62,12 @@ main(int argc, const char * argv[]) {
     }
 
     listenfd = init_socket(ip, port);
-    
-    kq = kqueue();
-    ret = kqueue_register(kq, listenfd, NULL);
-    if(ret < 0) {
-        cout << "[error] kqueue error" << endl;
-        exit(1);
-    }
+    evfd = socks5_event_init();
+    ret = socks5_event_add(evfd, listenfd, NULL);
+
     while(1) {
+#ifdef __APPLE__
+        struct kevent                     revents[1024];
         cout << "[debug] kqueue wait..." << endl;
         int nev = kevent(kq, NULL, 0, revents, 1024, NULL);
         if(nev < 0) {
@@ -88,12 +84,13 @@ main(int argc, const char * argv[]) {
 
             fd = kv.ident;
             if(fd == listenfd) {
-                accept_and_add(kq, mp, fd);
+                accept_and_add(evfd, mp, fd);
 
             } else {
-                recv_and_process(kq, mp, &kv, fd);
+                recv_and_process(evfd, mp, &kv, fd);
             }
         }
+#endif
     }
 
     ::close(listenfd);
@@ -136,17 +133,52 @@ init_socket(string ip, int port) {
     return sockfd;
 }
 
+int
+socks5_event_init() {
+    int        evfd;
+#ifdef __APPLE__
+    evfd = kqueue();
+#elif __linux__
+    evfd = epoll_create(256);
+#endif
+
+    if(evfd < 0) {
+        printf("[error] socks5 event init error");
+        exit(1);
+    }
+
+    return evfd;
+}
+
 int 
-kqueue_register(int kq, int fd, void *data) {
+socks5_event_add(int evfd, int fd, void *data) {
+    int        ret;
+#ifdef __APPLE__
     struct kevent changes[1];
     EV_SET(&changes[0], fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
 
-    int ret = kevent(kq, changes, 1, NULL, 0, NULL);
+    ret = kevent(evfd, changes, 1, NULL, 0, NULL);
+#elif __linux__
+
+#endif
+    return ret;
+}
+
+int 
+socks5_event_del(int evfd, int fd) {
+    int        ret;
+    
+    ret = 0;
+#ifdef __APPLE__
+
+#elif __linux__
+
+#endif
     return ret;
 }
 
 void 
-accept_and_add(int kq, client_ctx_map &mp, int listenfd) {
+accept_and_add(int evfd, client_ctx_map &mp, int listenfd) {
     socks5_client_ctx      *ctx;
 
     ctx = new socks5_client_ctx;
@@ -157,7 +189,7 @@ accept_and_add(int kq, client_ctx_map &mp, int listenfd) {
     ctx->ip = inet_ntoa(((sockaddr_in *)(ctx->addr))->sin_addr);
     ctx->port = ntohs(((sockaddr_in *)ctx->addr)->sin_port);
 
-    kqueue_register(kq, ctx->sockfd, NULL);
+    socks5_event_add(evfd, ctx->sockfd, NULL);
 
     mp[ctx->sockfd] = ctx;
 
@@ -166,7 +198,7 @@ accept_and_add(int kq, client_ctx_map &mp, int listenfd) {
 }
 
 void
-recv_and_process(int kq, client_ctx_map &mp , struct kevent *kv, int sockfd) {
+recv_and_process(int evfd, client_ctx_map &mp , int sockfd) {
     int                            ret;
     client_status                  status;
     socks5_client_ctx             *ctx;
@@ -189,7 +221,7 @@ recv_and_process(int kq, client_ctx_map &mp , struct kevent *kv, int sockfd) {
         }
     case CONNECTING:
         {
-            ret = socks5_connect(kq, sockfd, ctx, mp);
+            ret = socks5_connect(evfd, sockfd, ctx, mp);
             ctx->status = WORKING;
             break;
         }
@@ -232,8 +264,8 @@ socks5_send(int sockfd, void *buffer, int size, int flag) {
 
 int
 socks5_recv(int sockfd, int flag, socks5_client_ctx *ctx) {
-    int        ret, *size, *capacity;
-    char     **buffer;
+    int            ret, *size, *capacity;
+    u_char       **buffer;
 
     buffer = &ctx->buffer;
     size = &ctx->size;
@@ -286,7 +318,7 @@ close_and_delete(client_ctx_map &mp, socks5_client_ctx *ctx) {
 int
 socks5_shake_hands(int sockfd, socks5_client_ctx *ctx) {
     int                           ret;
-    char                         *buffer;
+    u_char                       *buffer;
     shake_hands_request_t         req;
     shake_hands_response_t        res;
 
@@ -303,11 +335,11 @@ socks5_shake_hands(int sockfd, socks5_client_ctx *ctx) {
     }
     ctx->size = 0;
 
-    res.version = 0x05;
+    res.version = SOCKS5_VERSION;
     res.method = choose_authentication_method(req);
-    if(res.method < 0) {
+    if(res.method == METHOD_NO_ACCEPTABLE) {
         cout << "[debug] No acceptable methods" << endl;
-        res.method = 0xff;
+        res.method = METHOD_NO_ACCEPTABLE;
         ret = socks5_send(sockfd, &res, sizeof(res), 0);
         if(ret < 0) {
             return -1;
@@ -329,7 +361,7 @@ socks5_shake_hands(int sockfd, socks5_client_ctx *ctx) {
 
 int
 parse_shake_hands(socks5_client_ctx *ctx, shake_hands_request_t &r) {
-    const char    *p;
+    const u_char        *p;
     
     if(ctx->size < 3) {
         return -1;
@@ -337,7 +369,7 @@ parse_shake_hands(socks5_client_ctx *ctx, shake_hands_request_t &r) {
 
     p = ctx->buffer;
     
-    if(*p != 0x05) {
+    if(*p != SOCKS5_VERSION) {
         printf("[error] client %s:%d version error(%#x)\n",
                ctx->ip.c_str(), ctx->port, *p);
         return -1;
@@ -349,27 +381,34 @@ parse_shake_hands(socks5_client_ctx *ctx, shake_hands_request_t &r) {
     r.nmethods = *p;
     ++p;
 
-    for(char i = 0x0; i < r.nmethods; ++i) {
+    for(u_char i = 0x0; i < r.nmethods; ++i) {
         r.methods[i] = *(p + i);
     }
 
     return 0;
 }
 
-char
+u_char
 choose_authentication_method(const shake_hands_request_t &r) {
-    return 0x00;
+
+    for(int i = 0; i < r.nmethods; ++i) {
+        if(r.methods[i] == METHOD_NO_AUTHEN_REQUIRED) {
+            return METHOD_NO_AUTHEN_REQUIRED;
+        }
+    }
+
+    return METHOD_NO_ACCEPTABLE;
 }
 
 int
-authentication(char method) {
+authentication(u_char method) {
+    /*  TODO: surrport more authentication */
     return 0;
 }
 
 int
-socks5_connect(int kq, int sockfd, socks5_client_ctx *ctx, client_ctx_map &mp) {
+socks5_connect(int evfd, int sockfd, socks5_client_ctx *ctx, client_ctx_map &mp) {
     int                        len, ret;
-    char                       send_buffer[BUFFER_SIZE];
     connect_response_t        *res;
     
     res = &ctx->conn_res;
@@ -383,21 +422,21 @@ socks5_connect(int kq, int sockfd, socks5_client_ctx *ctx, client_ctx_map &mp) {
     if(res->reply == 0) {
         ctx->upstream.connected = true;
         mp[ctx->upstream.sockfd] = ctx;
-        kqueue_register(kq, ctx->upstream.sockfd, NULL);
+        socks5_event_add(evfd, ctx->upstream.sockfd, NULL);
 
         printf("[debug] client %s:%d fd = %d, upstream is connected ,upstream fd = %d\n",
                ctx->ip.c_str(), ctx->port, ctx->sockfd, ctx->upstream.sockfd);
     }
 
-    res->version = 0x05;
-    res->reserved = 0x00;
-    res->address_type = 0x01;
+    res->version = SOCKS5_VERSION;
+    res->reserved = SOCKS5_RESERVED;
+    res->address_type = ATYP_IPV4;
     res->bind_address = "\0\0\0\0";
     res->bind_port = 0x0000;
 
-    len = connect_response_serialization(res, send_buffer, BUFFER_SIZE);
+    len = connect_response_serialization(res, ctx);
     
-    ret = socks5_send(sockfd, send_buffer, len, 0);
+    ret = socks5_send(sockfd, ctx->buffer, ctx->size, 0);
     if(ret < 0) {
         return -1;
     }
@@ -406,19 +445,19 @@ socks5_connect(int kq, int sockfd, socks5_client_ctx *ctx, client_ctx_map &mp) {
 }
 
 int
-connect_response_serialization(connect_response_t *res, char *buffer, int size) {
-    int        byte_count;
-    char      *p;
+connect_response_serialization(connect_response_t *res, socks5_client_ctx *ctx) {
+    int            byte_count;
+    u_char        *p;
 
     byte_count = 0;
-    p = buffer;
+    p = ctx->buffer;
 
     memcpy(p, res, 4);
     p += 4;
     byte_count += 4;
 
     switch(res->address_type) {
-    case 0x01:
+    case ATYP_IPV4:
         {
             //memcpy(p, res->bind_address.c_str(), 4);
             memset(p, 0, 4);
@@ -426,14 +465,14 @@ connect_response_serialization(connect_response_t *res, char *buffer, int size) 
             byte_count += 4;
             break;
         }
-    case 0x03:
+    case ATYP_DOMANNAME:
         {
             memcpy(p, res->bind_address.c_str(), res->bind_address.size());
             p += res->bind_address.size();
             byte_count += res->bind_address.size();
             break;
         }
-    case 0x04:
+    case ATYP_IPV6:
         {
             //memcpy(p, res->bind_address.c_str(), 16);
             memset(p, 0, 16);
@@ -450,12 +489,14 @@ connect_response_serialization(connect_response_t *res, char *buffer, int size) 
     memcpy(p, &res->bind_port, 2);
     byte_count += 2;
 
+    ctx->size += byte_count;
+
     return byte_count;
 }
 
-char 
+u_char 
 parse_connect_request(socks5_client_ctx *ctx) {
-    const char                   *p;
+    const u_char                 *p;
     connect_request_t            *req;
 
     p = ctx->buffer;
@@ -468,59 +509,59 @@ parse_connect_request(socks5_client_ctx *ctx) {
     cout << endl;
 
     req->version = *p;
-    if(req->version != 0x05) {
+    if(req->version != SOCKS5_VERSION) {
         cout << "[error] Client " << ctx->ip 
              << " connect request: version error" << endl;
-        return 0x02;
+        return REP_CONNECT_NOT_ALLOWED;
     }
 
     ++p;
     req->command = *p;
-    if(req->command != 0x01 &&
-       req->command != 0x02 &&
-       req->command != 0x03) {
+    if(req->command != CMD_CONNECT &&
+       req->command != CMD_BIND &&
+       req->command != CMD_UDP_ASSOCIATE) {
         cout << "[error] Client " << ctx->ip
              << " connect request: command error" << endl;
-        return 0x07;
+        return REP_COMMAND_NOT_SUPPORTED;
     }
 
     ++p;
     req->reserved = *p;
-    if(req->reserved != 0x00) {
+    if(req->reserved != SOCKS5_RESERVED) {
         cout << "[error] Client " << ctx->ip
              << " connect request: reserved error" << endl;
-        return 0x02;
+        return REP_CONNECT_NOT_ALLOWED;
     }
 
     ++p;
     req->address_type = *p;
-    if(req->address_type != 0x01 &&
-       req->address_type != 0x03 &&
-       req->address_type != 0x04) {
+    if(req->address_type != ATYP_IPV4 &&
+       req->address_type != ATYP_DOMANNAME &&
+       req->address_type != ATYP_IPV6) {
         cout << "[error] Client " << ctx->ip
              << " connect request: address type error" << endl;
-        return 0x08;
+        return REP_ATYP_NOT_SUPPORTED;
     }
 
     ++p;
     switch(req->address_type) {
-    case 0x01:
+    case ATYP_IPV4:
         {
-            char ip[INET_ADDRSTRLEN] = {0};
+            char         ip[INET_ADDRSTRLEN] = {0};
             req->dest_address = inet_ntop(AF_INET, p, ip, INET_ADDRSTRLEN);
             p += 4;
             
             break;
         }
-    case 0x03:
+    case ATYP_DOMANNAME:
         {
             int len = *p;
             ++p;
-            req->dest_address.assign(string(p, len));
+            req->dest_address.assign(string((char *)p, len));
             p += len;
             break;
         }
-    case 0x04:
+    case ATYP_IPV6:
         {
             char        ip[INET6_ADDRSTRLEN] = {0};
             req->dest_address = inet_ntop(AF_INET6, p, ip, INET6_ADDRSTRLEN);
@@ -537,7 +578,7 @@ parse_connect_request(socks5_client_ctx *ctx) {
     printf("[debug] client %s:%d's upstream server: %s:%d\n",
            ctx->ip.c_str(), ctx->port, req->dest_address.c_str(), req->dest_port);
 
-    return 0x00;
+    return REP_SUCCEEDED;
 }
 
 int
@@ -550,7 +591,7 @@ connect_to_upstream(socks5_client_ctx *ctx) {
     req = &ctx->conn_req;
     
     switch(req->address_type) {
-    case 0x01:
+    case ATYP_IPV4:
         {
             sockaddr_in           *peer_addr;
 
@@ -566,11 +607,11 @@ connect_to_upstream(socks5_client_ctx *ctx) {
             ret = connect(upstream->sockfd, upstream->addr, upstream->addr_len);
             if(ret < 0) {
                 cout << "[error] Connect to " << req->dest_address << " failed" << endl;
-                return 0x04;
+                return REP_HOST_NOREACHABLE;
             }
             break;
         }
-    case 0x03:
+    case ATYP_DOMANNAME:
         {
             char                  *ip;
             struct hostent        *ht;
@@ -580,7 +621,7 @@ connect_to_upstream(socks5_client_ctx *ctx) {
             ht = gethostbyname(req->dest_address.c_str());
             if(ht->h_addr == NULL) {
                 cout << "[error] Hostname " << req->dest_address << " DNS parse failed" << endl;
-                return 0x04;
+                return REP_HOST_NOREACHABLE;
             }
 
             peer_addr = (sockaddr_in *)malloc(sizeof(sockaddr_in));
@@ -605,11 +646,11 @@ connect_to_upstream(socks5_client_ctx *ctx) {
 
             if(ret < 0) {
                 cout << "[error] Connect to " << req->dest_address << " failed" << endl;
-                return 0x04;
+                return REP_HOST_NOREACHABLE;
             }
             break;
         }
-    case 0x04:
+    case ATYP_IPV6:
         {
             /* TODO: support IPv6 */
             break;
@@ -626,7 +667,7 @@ connect_to_upstream(socks5_client_ctx *ctx) {
 int
 socks5_forward(int dstfd, int srcfd, socks5_client_ctx *ctx) {
     int          capacity, size, ret;
-    char        *buffer;
+    u_char      *buffer;
 
     cout << "[debug] forward: fd " << srcfd << "->" << " fd " << dstfd << endl;
     
@@ -644,12 +685,12 @@ socks5_forward(int dstfd, int srcfd, socks5_client_ctx *ctx) {
     return 0;
 }
 
-char *
-buffer_expansion(char *buffer, int capacity) {
+u_char *
+buffer_expansion(u_char *buffer, int capacity) {
     int        new_capacity;
 
     new_capacity = 2 * capacity;
-    buffer = (char *)reallocf(buffer, new_capacity);
+    buffer = (u_char *)realloc(buffer, new_capacity);
 
     return buffer;
 }
