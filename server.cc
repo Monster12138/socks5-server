@@ -69,7 +69,7 @@ main(int argc, const char * argv[]) {
 #ifdef __APPLE__
         struct kevent                     revents[1024];
         cout << "[debug] kqueue wait..." << endl;
-        int nev = kevent(kq, NULL, 0, revents, 1024, NULL);
+        int nev = kevent(evfd, NULL, 0, revents, 1024, NULL);
         if(nev < 0) {
             cout << "[error] kqueue error" << endl;
             break;
@@ -87,7 +87,33 @@ main(int argc, const char * argv[]) {
                 accept_and_add(evfd, mp, fd);
 
             } else {
-                recv_and_process(evfd, mp, &kv, fd);
+                recv_and_process(evfd, mp, fd);
+            }
+        }
+#elif __linux__
+        struct epoll_event                revents[1024];
+        cout << "[debug] epoll wait..." << endl;
+        int nev = epoll_wait(evfd, revents, 1024, -1);
+        if(nev < 0) {
+            cout << "[error] epoll wait errpr" << endl;
+            break;
+        } else if (nev == 0) {
+            cout << "[debug] epoll wait timeout..." << endl;
+            continue;
+        }
+
+        for(int i = 0; i < nev; ++i) {
+            int                        fd;
+            struct epoll_event         ev;
+
+            ev = revents[i];
+            fd = ev.data.fd;
+
+            if(fd == listenfd) {
+                accept_and_add(evfd, mp, fd);
+
+            } else {
+                recv_and_process(evfd, mp, fd);
             }
         }
 #endif
@@ -99,11 +125,19 @@ main(int argc, const char * argv[]) {
 
 int 
 init_socket(string ip, int port) {
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    int        ret, sockfd, opt;
+
+    opt = 1;
+
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if(sockfd < 0) {
         cout << "[error] create sockfd error" << endl;
         exit(-1);
     }
+
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, 
+               (const void*)&opt, sizeof(opt));
+
     
     sockaddr_in local;
     local.sin_family  = AF_INET;
@@ -117,7 +151,6 @@ init_socket(string ip, int port) {
     socklen_t socklen;
     socklen = sizeof(sockaddr_in);
     
-    int ret;
     ret = ::bind(sockfd, (sockaddr *)&local, socklen);
     if(ret < 0) {
         cout << "[error] bind error" << endl;
@@ -159,8 +192,18 @@ socks5_event_add(int evfd, int fd, void *data) {
 
     ret = kevent(evfd, changes, 1, NULL, 0, NULL);
 #elif __linux__
+    struct epoll_event        ev;
+
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    ret = epoll_ctl(evfd, EPOLL_CTL_ADD, fd, &ev);
 
 #endif
+
+    if(ret < 0) {
+        printf("[error] socks5 event add error");
+        exit(1);
+    }
     return ret;
 }
 
@@ -172,8 +215,14 @@ socks5_event_del(int evfd, int fd) {
 #ifdef __APPLE__
 
 #elif __linux__
+    ret = epoll_ctl(evfd, EPOLL_CTL_DEL, fd, NULL);
 
 #endif
+
+    if(ret < 0) {
+        printf("[error] socks5 event add error");
+        exit(1);
+    }
     return ret;
 }
 
