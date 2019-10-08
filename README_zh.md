@@ -10,6 +10,7 @@
 
 ## SwitchyOmega插件设置
 ![image](https://github.com/Monster12138/socks5-server/blob/master/SwitchyOmega-config.png)
+**注：图中的IP和端口号需要改为代理服务器工作主机的外网IP地址+对应端口号。**
 
 ## 编译 
 ```
