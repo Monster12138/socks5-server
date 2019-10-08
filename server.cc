@@ -489,6 +489,7 @@ socks5_connect(int evfd, int sockfd, socks5_client_ctx *ctx, client_ctx_map &mp)
     if(ret < 0) {
         return -1;
     }
+    ctx->size = 0;
     
     return 0;
 }
