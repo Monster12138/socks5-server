@@ -1,8 +1,7 @@
 # socks5-server
 A proxy server for socks5 protocol with c++
 
-This proxy server currently only supports MacOS/FreeBSD operating system.
-Linux support will be updated in the future.
+This proxy server currently only supports MacOS and Linux operating system.
 
 ## use
 This proxy server needs to be used with the proxy client, such as the Chrome browser plug-in SwitchyOmega.
